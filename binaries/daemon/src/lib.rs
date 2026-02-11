@@ -81,6 +81,7 @@ mod node_communication;
 mod pending;
 mod socket_stream_utils;
 mod spawn;
+pub(crate) mod state;
 
 #[cfg(feature = "telemetry")]
 use dora_tracing::telemetry::serialize_context;
@@ -92,31 +93,21 @@ use crate::{extract_err_from_stderr::extract_err_from_stderr, pending::DataflowS
 const STDERR_LOG_LINES_MAX: usize = 500;
 
 pub struct Daemon {
-    running: HashMap<DataflowId, RunningDataflow>,
-    working_dir: HashMap<DataflowId, PathBuf>,
-
-    events_tx: mpsc::Sender<Timestamped<Event>>,
+    pub(crate) state: Arc<state::DaemonState>,
 
     coordinator_connection: Option<TcpStream>,
     last_coordinator_heartbeat: Instant,
-    daemon_id: DaemonId,
 
     /// used for testing and examples
     exit_when_done: Option<BTreeSet<(Uuid, NodeId)>>,
     /// set on ctrl-c
     exit_when_all_finished: bool,
-    /// used to record results of local nodes
-    dataflow_node_results: BTreeMap<Uuid, BTreeMap<NodeId, Result<(), NodeError>>>,
-
-    clock: Arc<uhlc::HLC>,
 
     zenoh_session: zenoh::Session,
     remote_daemon_events_tx: Option<flume::Sender<eyre::Result<Timestamped<InterDaemonEvent>>>>,
 
     logger: DaemonLogger,
 
-    sessions: BTreeMap<SessionId, BuildId>,
-    builds: BTreeMap<BuildId, BuildInfo>,
     git_manager: GitManager,
     /// System instance for metrics collection (reused across calls)
     metrics_system: sysinfo::System,
@@ -378,6 +369,23 @@ impl Daemon {
             .wrap_err("failed to open zenoh session")?;
         // Use a large channel capacity to prevent deadlock
         let (dora_events_tx, dora_events_rx) = mpsc::channel(1000);
+        let daemon_state = Arc::new(state::DaemonState {
+            clock: clock.clone(),
+            daemon_id: daemon_id.clone(),
+            events_tx: dora_events_tx,
+            running: Default::default(),
+            working_dir: Default::default(),
+            dataflow_node_results: Default::default(),
+            sessions: Default::default(),
+            builds: {
+                let map = dashmap::DashMap::new();
+                for (k, v) in builds {
+                    map.insert(k, v);
+                }
+                map
+            },
+        });
+
         let daemon = Self {
             logger: Logger {
                 destination: log_destination,
@@ -385,26 +393,19 @@ impl Daemon {
                 clock: clock.clone(),
             }
             .for_daemon(daemon_id.clone()),
-            running: HashMap::new(),
-            working_dir: HashMap::new(),
-            events_tx: dora_events_tx,
+            state: daemon_state,
             coordinator_connection,
             last_coordinator_heartbeat: Instant::now(),
-            daemon_id,
             exit_when_done,
             exit_when_all_finished: false,
-            dataflow_node_results: BTreeMap::new(),
-            clock,
             zenoh_session,
             remote_daemon_events_tx,
             git_manager: Default::default(),
-            builds,
-            sessions: Default::default(),
             metrics_system: sysinfo::System::new(),
         };
 
         let dora_events = ReceiverStream::new(dora_events_rx);
-        let watchdog_clock = daemon.clock.clone();
+        let watchdog_clock = daemon.state.clock.clone();
         let watchdog_interval = tokio_stream::wrappers::IntervalStream::new(tokio::time::interval(
             Duration::from_secs(5),
         ))
@@ -413,7 +414,7 @@ impl Daemon {
             timestamp: watchdog_clock.new_timestamp(),
         });
 
-        let metrics_clock = daemon.clock.clone();
+        let metrics_clock = daemon.state.clock.clone();
         let metrics_interval = tokio_stream::wrappers::IntervalStream::new(tokio::time::interval(
             Duration::from_secs(2), // Collect metrics every 2 seconds
         ))
@@ -432,7 +433,7 @@ impl Daemon {
         daemon.run_inner(events).await
     }
 
-    #[tracing::instrument(skip(incoming_events, self), fields(?self.daemon_id))]
+    #[tracing::instrument(skip(incoming_events, self), fields(?self.state.daemon_id))]
     async fn run_inner(
         mut self,
         incoming_events: impl Stream<Item = Timestamped<Event>> + Unpin,
@@ -441,7 +442,7 @@ impl Daemon {
 
         while let Some(event) = events.next().await {
             let Timestamped { inner, timestamp } = event;
-            if let Err(err) = self.clock.update_with_timestamp(&timestamp) {
+            if let Err(err) = self.state.clock.update_with_timestamp(&timestamp) {
                 tracing::warn!("failed to update HLC with incoming event timestamp: {err}");
             }
 
@@ -472,10 +473,10 @@ impl Daemon {
                     if let Some(connection) = &mut self.coordinator_connection {
                         let msg = serde_json::to_vec(&Timestamped {
                             inner: CoordinatorRequest::Event {
-                                daemon_id: self.daemon_id.clone(),
+                                daemon_id: self.state.daemon_id.clone(),
                                 event: DaemonEvent::Heartbeat,
                             },
-                            timestamp: self.clock.new_timestamp(),
+                            timestamp: self.state.clock.new_timestamp(),
                         })?;
                         socket_stream_send(connection, &msg)
                             .await
@@ -492,7 +493,7 @@ impl Daemon {
                 Event::CtrlC => {
                     tracing::info!("received ctrlc signal -> stopping all dataflows");
                     self.trigger_manual_stop().await?;
-                    if self.running.is_empty() {
+                    if self.state.running.is_empty() {
                         break;
                     }
                 }
@@ -503,7 +504,7 @@ impl Daemon {
                 Event::StopAfter(duration) => {
                     tracing::info!("stopping after {duration:?} as requested");
                     self.trigger_manual_stop().await?;
-                    if self.running.is_empty() {
+                    if self.state.running.is_empty() {
                         break;
                     }
                 }
@@ -517,7 +518,7 @@ impl Daemon {
                     result,
                 } => match result {
                     Ok(running_node) => {
-                        if let Some(dataflow) = self.running.get_mut(&dataflow_id) {
+                        if let Some(mut dataflow) = self.state.running.get_mut(&dataflow_id) {
                             dataflow.running_nodes.insert(node_id, running_node);
                         } else {
                             tracing::error!(
@@ -526,7 +527,8 @@ impl Daemon {
                         }
                     }
                     Err(error) => {
-                        self.dataflow_node_results
+                        self.state
+                            .dataflow_node_results
                             .entry(dataflow_id)
                             .or_default()
                             .insert(node_id.clone(), Err(error));
@@ -544,21 +546,22 @@ impl Daemon {
                         Err(err) => (None, Err(err)),
                     };
                     if let Some(build_info) = build_info {
-                        self.builds.insert(build_id, build_info);
-                        if let Some(old_build_id) = self.sessions.insert(session_id, build_id) {
-                            self.builds.remove(&old_build_id);
+                        self.state.builds.insert(build_id, build_info);
+                        if let Some(old_build_id) = self.state.sessions.insert(session_id, build_id)
+                        {
+                            self.state.builds.remove(&old_build_id);
                         }
                     }
                     if let Some(connection) = &mut self.coordinator_connection {
                         let msg = serde_json::to_vec(&Timestamped {
                             inner: CoordinatorRequest::Event {
-                                daemon_id: self.daemon_id.clone(),
+                                daemon_id: self.state.daemon_id.clone(),
                                 event: DaemonEvent::BuildResult {
                                     build_id,
                                     result: result.map_err(|err| format!("{err:?}")),
                                 },
                             },
-                            timestamp: self.clock.new_timestamp(),
+                            timestamp: self.state.clock.new_timestamp(),
                         })?;
                         socket_stream_send(connection, &msg).await.wrap_err(
                             "failed to send BuildDataflowResult message to dora-coordinator",
@@ -572,13 +575,13 @@ impl Daemon {
                     if let Some(connection) = &mut self.coordinator_connection {
                         let msg = serde_json::to_vec(&Timestamped {
                             inner: CoordinatorRequest::Event {
-                                daemon_id: self.daemon_id.clone(),
+                                daemon_id: self.state.daemon_id.clone(),
                                 event: DaemonEvent::SpawnResult {
                                     dataflow_id,
                                     result: result.map_err(|err| format!("{err:?}")),
                                 },
                             },
-                            timestamp: self.clock.new_timestamp(),
+                            timestamp: self.state.clock.new_timestamp(),
                         })?;
                         socket_stream_send(connection, &msg).await.wrap_err(
                             "failed to send SpawnDataflowResult message to dora-coordinator",
@@ -598,7 +601,7 @@ impl Daemon {
                             break;
                         }
                     }
-                    if self.exit_when_all_finished && self.running.is_empty() {
+                    if self.exit_when_all_finished && self.state.running.is_empty() {
                         break;
                     }
                 }
@@ -617,29 +620,35 @@ impl Daemon {
         if let Some(mut connection) = self.coordinator_connection.take() {
             let msg = serde_json::to_vec(&Timestamped {
                 inner: CoordinatorRequest::Event {
-                    daemon_id: self.daemon_id.clone(),
+                    daemon_id: self.state.daemon_id.clone(),
                     event: DaemonEvent::Exit,
                 },
-                timestamp: self.clock.new_timestamp(),
+                timestamp: self.state.clock.new_timestamp(),
             })?;
             socket_stream_send(&mut connection, &msg)
                 .await
                 .wrap_err("failed to send Exit message to dora-coordinator")?;
         }
 
-        Ok(self.dataflow_node_results)
+        Ok(self
+            .state
+            .dataflow_node_results
+            .iter()
+            .map(|entry| (*entry.key(), entry.value().clone()))
+            .collect())
     }
 
     async fn trigger_manual_stop(&mut self) -> eyre::Result<()> {
         // Collect dataflow IDs that need immediate finishing
         let mut dataflows_to_finish = Vec::new();
 
-        for dataflow in self.running.values_mut() {
+        for mut entry in self.state.running.iter_mut() {
+            let dataflow = entry.value_mut();
             let mut logger = self.logger.for_dataflow(dataflow.id);
             let finish_when = dataflow
                 .stop_all(
                     &mut self.coordinator_connection,
-                    &self.clock,
+                    &self.state.clock,
                     None,
                     false,
                     &mut logger,
@@ -704,8 +713,8 @@ impl Daemon {
                     error!("could not send `TriggerBuildResult` reply from daemon to coordinator")
                 });
 
-                let result_tx = self.events_tx.clone();
-                let clock = self.clock.clone();
+                let result_tx = self.state.events_tx.clone();
+                let clock = self.state.clock.clone();
                 if let Some(result_task) = result_task {
                     tokio::spawn(async move {
                         let message = Timestamped {
@@ -767,8 +776,8 @@ impl Daemon {
                     error!("could not send `TriggerSpawnResult` reply from daemon to coordinator")
                 });
 
-                let result_tx = self.events_tx.clone();
-                let clock = self.clock.clone();
+                let result_tx = self.state.events_tx.clone();
+                let clock = self.state.clock.clone();
                 if let Some(result_task) = result_task {
                     tokio::spawn(async move {
                         let message = Timestamped {
@@ -800,14 +809,14 @@ impl Daemon {
                     Some("daemon".into()),
                     format!("received AllNodesReady (exited_before_subscribe: {exited_before_subscribe:?})"
                 )).await;
-                match self.running.get_mut(&dataflow_id) {
-                    Some(dataflow) => {
+                match self.state.running.get_mut(&dataflow_id) {
+                    Some(mut dataflow) => {
                         let ready = exited_before_subscribe.is_empty();
-                        dataflow
-                            .pending_nodes
+                        let df = &mut *dataflow;
+                        df.pending_nodes
                             .handle_external_all_nodes_ready(
                                 exited_before_subscribe,
-                                &mut dataflow.cascading_error_causes,
+                                &mut df.cascading_error_causes,
                             )
                             .await?;
                         if ready {
@@ -815,7 +824,9 @@ impl Daemon {
                                 Some("daemon".into()),
                                 "coordinator reported that all nodes are ready, starting dataflow",
                             ).await;
-                            dataflow.start(&self.events_tx, &self.clock).await?;
+                            dataflow
+                                .start(&self.state.events_tx, &self.state.clock)
+                                .await?;
                         }
                     }
                     None => {
@@ -834,7 +845,7 @@ impl Daemon {
                 node_id,
                 tail,
             } => {
-                match self.working_dir.get(&dataflow_id) {
+                match self.state.working_dir.get(&dataflow_id) {
                     Some(working_dir) => {
                         let working_dir = working_dir.clone();
                         tokio::spawn(async move {
@@ -901,34 +912,38 @@ impl Daemon {
             } => {
                 let finish_when = {
                     let mut logger = self.logger.for_dataflow(dataflow_id);
-                    let dataflow = self
-                        .running
-                        .get_mut(&dataflow_id)
-                        .wrap_err_with(|| format!("no running dataflow with ID `{dataflow_id}`"));
-                    let (reply, future) = match dataflow {
-                        Ok(dataflow) => {
-                            let future = dataflow.stop_all(
-                                &mut self.coordinator_connection,
-                                &self.clock,
-                                grace_duration,
-                                force,
-                                &mut logger,
-                            );
-                            (Ok(()), Some(future))
-                        }
-                        Err(err) => (Err(err.to_string()), None),
-                    };
-
-                    let _ = reply_tx
-                        .send(Some(DaemonCoordinatorReply::StopResult(reply)))
-                        .map_err(|_| {
-                            error!("could not send stop reply from daemon to coordinator")
+                    let dataflow =
+                        self.state.running.get_mut(&dataflow_id).wrap_err_with(|| {
+                            format!("no running dataflow with ID `{dataflow_id}`")
                         });
-
-                    if let Some(future) = future {
-                        Some(future.await?)
-                    } else {
-                        None
+                    match dataflow {
+                        Ok(mut dataflow) => {
+                            let _ = reply_tx
+                                .send(Some(DaemonCoordinatorReply::StopResult(Ok(()))))
+                                .map_err(|_| {
+                                    error!("could not send stop reply from daemon to coordinator")
+                                });
+                            let result = dataflow
+                                .stop_all(
+                                    &mut self.coordinator_connection,
+                                    &self.state.clock,
+                                    grace_duration,
+                                    force,
+                                    &mut logger,
+                                )
+                                .await?;
+                            Some(result)
+                        }
+                        Err(err) => {
+                            let _ = reply_tx
+                                .send(Some(DaemonCoordinatorReply::StopResult(Err(
+                                    err.to_string()
+                                ))))
+                                .map_err(|_| {
+                                    error!("could not send stop reply from daemon to coordinator")
+                                });
+                            None
+                        }
                     }
                 };
 
@@ -971,7 +986,8 @@ impl Daemon {
         const METRICS_INTERVAL_SECS: f64 = 2.0;
 
         // Collect metrics for all running dataflows
-        for (dataflow_id, dataflow) in &self.running {
+        for entry in self.state.running.iter() {
+            let (dataflow_id, dataflow) = (entry.key(), entry.value());
             let mut metrics = BTreeMap::new();
 
             // Collect all PIDs for this dataflow
@@ -1031,13 +1047,13 @@ impl Daemon {
                 if let Some(connection) = &mut self.coordinator_connection {
                     let msg = serde_json::to_vec(&Timestamped {
                         inner: CoordinatorRequest::Event {
-                            daemon_id: self.daemon_id.clone(),
+                            daemon_id: self.state.daemon_id.clone(),
                             event: DaemonEvent::NodeMetrics {
                                 dataflow_id: *dataflow_id,
                                 metrics,
                             },
                         },
-                        timestamp: self.clock.new_timestamp(),
+                        timestamp: self.state.clock.new_timestamp(),
                     })?;
                     socket_stream_send(connection, &msg)
                         .await
@@ -1059,16 +1075,17 @@ impl Daemon {
                 data,
             } => {
                 let inner = async {
-                    let dataflow = self.running.get_mut(&dataflow_id).wrap_err_with(|| {
-                        format!("send out failed: no running dataflow with ID `{dataflow_id}`")
-                    })?;
+                    let mut dataflow =
+                        self.state.running.get_mut(&dataflow_id).wrap_err_with(|| {
+                            format!("send out failed: no running dataflow with ID `{dataflow_id}`")
+                        })?;
                     send_output_to_local_receivers(
                         node_id.clone(),
                         output_id.clone(),
-                        dataflow,
+                        &mut *dataflow,
                         &metadata,
                         data.map(DataMessage::Vec),
-                        &self.clock,
+                        &self.state.clock,
                     )
                     .await?;
                     Result::<_, eyre::Report>::Ok(())
@@ -1103,13 +1120,14 @@ impl Daemon {
                     .await;
 
                 let inner = async {
-                    let dataflow = self.running.get_mut(&dataflow_id).wrap_err_with(|| {
-                        format!("send out failed: no running dataflow with ID `{dataflow_id}`")
-                    })?;
+                    let mut dataflow =
+                        self.state.running.get_mut(&dataflow_id).wrap_err_with(|| {
+                            format!("send out failed: no running dataflow with ID `{dataflow_id}`")
+                        })?;
 
                     if let Some(inputs) = dataflow.mappings.get(&output_id).cloned() {
                         for (receiver_id, input_id) in &inputs {
-                            close_input(dataflow, receiver_id, input_id, &self.clock);
+                            close_input(&mut *dataflow, receiver_id, input_id, &self.state.clock);
                         }
                     }
                     Result::<(), eyre::Report>::Ok(())
@@ -1243,23 +1261,24 @@ impl Daemon {
             .context("failed to clone logger")?;
         let dataflow = RunningDataflow::new(
             dataflow_id,
-            self.daemon_id.clone(),
+            self.state.daemon_id.clone(),
             dataflow_descriptor.clone(),
         );
-        let dataflow = match self.running.entry(dataflow_id) {
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                self.working_dir
+        let mut dataflow = match self.state.running.entry(dataflow_id) {
+            dashmap::Entry::Vacant(entry) => {
+                self.state
+                    .working_dir
                     .insert(dataflow_id, base_working_dir.clone());
                 entry.insert(dataflow)
             }
-            std::collections::hash_map::Entry::Occupied(_) => {
+            dashmap::Entry::Occupied(_) => {
                 bail!("there is already a running dataflow with ID `{dataflow_id}`")
             }
         };
 
         let mut stopped = Vec::new();
 
-        let build_info = build_id.and_then(|build_id| self.builds.get(&build_id));
+        let build_info = build_id.and_then(|build_id| self.state.builds.get(&build_id));
         let node_with_git_source = nodes.values().find(|n| n.has_git_source());
         if let Some(git_node) = node_with_git_source {
             if build_info.is_none() {
@@ -1313,9 +1332,9 @@ impl Daemon {
 
         let spawner = Spawner {
             dataflow_id,
-            daemon_tx: self.events_tx.clone(),
+            daemon_tx: self.state.events_tx.clone(),
             dataflow_descriptor,
-            clock: self.clock.clone(),
+            clock: self.state.clock.clone(),
             uv,
         };
 
@@ -1382,13 +1401,14 @@ impl Daemon {
                         logger
                             .log(LogLevel::Error, Some("daemon".into()), format!("{err:?}"))
                             .await;
-                        self.dataflow_node_results
+                        self.state
+                            .dataflow_node_results
                             .entry(dataflow_id)
                             .or_default()
                             .insert(
                                 node_id.clone(),
                                 Err(NodeError {
-                                    timestamp: self.clock.new_timestamp(),
+                                    timestamp: self.state.clock.new_timestamp(),
                                     cause: NodeErrorCause::FailedToSpawn(format!("{err:?}")),
                                     exit_status: NodeExitStatus::Unknown,
                                 }),
@@ -1454,6 +1474,7 @@ impl Daemon {
                 }
             }
         }
+        drop(dataflow);
         for (node_id, dynamic) in stopped {
             self.handle_node_stop(dataflow_id, &node_id, dynamic)
                 .await?;
@@ -1463,8 +1484,8 @@ impl Daemon {
             dataflow_id,
             logger,
             tasks,
-            self.events_tx.clone(),
-            self.clock.clone(),
+            self.state.events_tx.clone(),
+            self.state.clock.clone(),
         );
 
         Ok(spawn_result)
@@ -1598,9 +1619,10 @@ impl Daemon {
                 reply_tx,
             } => {
                 let number_node_id = self
+                    .state
                     .running
                     .iter()
-                    .filter(|(_id, dataflow)| dataflow.running_nodes.contains_key(&node_id))
+                    .filter(|entry| entry.value().running_nodes.contains_key(&node_id))
                     .count();
 
                 let node_config = match number_node_id {
@@ -1610,10 +1632,12 @@ impl Daemon {
                         node id if you want to use dynamic node",
                     )),
                     1 => self
+                        .state
                         .running
                         .iter()
-                        .filter(|(_id, dataflow)| dataflow.running_nodes.contains_key(&node_id))
-                        .map(|(id, dataflow)| -> Result<NodeConfig> {
+                        .filter(|entry| entry.value().running_nodes.contains_key(&node_id))
+                        .map(|entry| -> Result<NodeConfig> {
+                            let (id, dataflow) = (entry.key(), entry.value());
                             let node_config = dataflow
                                 .running_nodes
                                 .get(&node_id)
@@ -1656,7 +1680,7 @@ impl Daemon {
         node_id: NodeId,
     ) -> eyre::Result<()> {
         let might_restart = || {
-            let dataflow = self.running.get(&dataflow_id)?;
+            let dataflow = self.state.running.get(&dataflow_id)?;
             let node = dataflow.running_nodes.get(&node_id)?;
             Some(match node.restart_policy {
                 RestartPolicy::Never => false,
@@ -1679,7 +1703,7 @@ impl Daemon {
                     )
                     .await;
 
-                let dataflow = self.running.get_mut(&dataflow_id).ok_or_else(|| {
+                let dataflow = self.state.running.get_mut(&dataflow_id).ok_or_else(|| {
                     format!("subscribe failed: no running dataflow with ID `{dataflow_id}`")
                 });
 
@@ -1687,17 +1711,24 @@ impl Daemon {
                     Err(err) => {
                         let _ = reply_sender.send(DaemonReply::Result(Err(err)));
                     }
-                    Ok(dataflow) => {
-                        Self::subscribe(dataflow, node_id.clone(), event_sender, &self.clock).await;
+                    Ok(mut dataflow) => {
+                        Self::subscribe(
+                            &mut *dataflow,
+                            node_id.clone(),
+                            event_sender,
+                            &self.state.clock,
+                        )
+                        .await;
 
-                        let status = dataflow
+                        let df = &mut *dataflow;
+                        let status = df
                             .pending_nodes
                             .handle_node_subscription(
                                 node_id.clone(),
                                 reply_sender,
                                 &mut self.coordinator_connection,
-                                &self.clock,
-                                &mut dataflow.cascading_error_causes,
+                                &self.state.clock,
+                                &mut df.cascading_error_causes,
                                 &mut logger,
                             )
                             .await?;
@@ -1711,7 +1742,9 @@ impl Daemon {
                                         "all nodes are ready, starting dataflow",
                                     )
                                     .await;
-                                dataflow.start(&self.events_tx, &self.clock).await?;
+                                dataflow
+                                    .start(&self.state.events_tx, &self.state.clock)
+                                    .await?;
                                 dataflow.dataflow_started = true;
                             }
                             _ => {}
@@ -1723,11 +1756,11 @@ impl Daemon {
                 event_sender,
                 reply_sender,
             } => {
-                let dataflow = self.running.get_mut(&dataflow_id).wrap_err_with(|| {
+                let dataflow = self.state.running.get_mut(&dataflow_id).wrap_err_with(|| {
                     format!("failed to subscribe: no running dataflow with ID `{dataflow_id}`")
                 });
                 let result = match dataflow {
-                    Ok(dataflow) => {
+                    Ok(mut dataflow) => {
                         dataflow.drop_channels.insert(node_id, event_sender);
                         Ok(())
                     }
@@ -1779,7 +1812,7 @@ impl Daemon {
                 .await
                 .context("failed to send out")?,
             DaemonNodeEvent::ReportDrop { tokens } => {
-                let dataflow = self.running.get_mut(&dataflow_id).wrap_err_with(|| {
+                let dataflow = self.state.running.get_mut(&dataflow_id).wrap_err_with(|| {
                     format!(
                         "failed to get handle drop tokens: \
                         no running dataflow with ID `{dataflow_id}`"
@@ -1787,12 +1820,12 @@ impl Daemon {
                 });
 
                 match dataflow {
-                    Ok(dataflow) => {
+                    Ok(mut dataflow) => {
                         for token in tokens {
                             match dataflow.pending_drop_tokens.get_mut(&token) {
                                 Some(info) => {
                                     if info.pending_nodes.remove(&node_id) {
-                                        dataflow.check_drop_token(token, &self.clock).await?;
+                                        dataflow.check_drop_token(token, &self.state.clock).await?;
                                     } else {
                                         tracing::warn!(
                                             "node `{node_id}` is not pending for drop token `{token:?}`"
@@ -1808,10 +1841,10 @@ impl Daemon {
             }
             DaemonNodeEvent::EventStreamDropped { reply_sender } => {
                 let inner = async {
-                    let dataflow = self
-                        .running
-                        .get_mut(&dataflow_id)
-                        .wrap_err_with(|| format!("no running dataflow with ID `{dataflow_id}`"))?;
+                    let mut dataflow =
+                        self.state.running.get_mut(&dataflow_id).wrap_err_with(|| {
+                            format!("no running dataflow with ID `{dataflow_id}`")
+                        })?;
                     dataflow.subscribe_channels.remove(&node_id);
                     Result::<_, eyre::Error>::Ok(())
                 };
@@ -1829,11 +1862,15 @@ impl Daemon {
         node_id: NodeId,
         operator_id: Option<OperatorId>,
     ) -> Result<(), eyre::ErrReport> {
-        let dataflow = self.running.get_mut(&dataflow_id).wrap_err_with(|| {
+        let mut dataflow = self.state.running.get_mut(&dataflow_id).wrap_err_with(|| {
             format!("Reload failed: no running dataflow with ID `{dataflow_id}`")
         })?;
         if let Some(channel) = dataflow.subscribe_channels.get(&node_id) {
-            match send_with_timestamp(channel, NodeEvent::Reload { operator_id }, &self.clock) {
+            match send_with_timestamp(
+                channel,
+                NodeEvent::Reload { operator_id },
+                &self.state.clock,
+            ) {
                 Ok(()) => {}
                 Err(_) => {
                     dataflow.subscribe_channels.remove(&node_id);
@@ -1851,22 +1888,23 @@ impl Daemon {
         metadata: dora_message::metadata::Metadata,
         data: Option<DataMessage>,
     ) -> Result<(), eyre::ErrReport> {
-        let dataflow = self.running.get_mut(&dataflow_id).wrap_err_with(|| {
+        let mut dataflow = self.state.running.get_mut(&dataflow_id).wrap_err_with(|| {
             format!("send out failed: no running dataflow with ID `{dataflow_id}`")
         })?;
         let data_bytes = send_output_to_local_receivers(
             node_id.clone(),
             output_id.clone(),
-            dataflow,
+            &mut *dataflow,
             &metadata,
             data,
-            &self.clock,
+            &self.state.clock,
         )
         .await?;
 
         let output_id = OutputId(node_id, output_id);
         let remote_receivers = dataflow.open_external_mappings.contains(&output_id)
             || dataflow.publish_all_messages_to_zenoh;
+        drop(dataflow);
         if remote_receivers {
             let event = InterDaemonEvent::Output {
                 dataflow_id,
@@ -1888,7 +1926,7 @@ impl Daemon {
         output_id: &OutputId,
         event: InterDaemonEvent,
     ) -> Result<(), eyre::Error> {
-        let dataflow = self.running.get_mut(&dataflow_id).wrap_err_with(|| {
+        let mut dataflow = self.state.running.get_mut(&dataflow_id).wrap_err_with(|| {
             format!("send out failed: no running dataflow with ID `{dataflow_id}`")
         })?;
 
@@ -1912,7 +1950,7 @@ impl Daemon {
 
         let serialized_event = Timestamped {
             inner: event,
-            timestamp: self.clock.new_timestamp(),
+            timestamp: self.state.clock.new_timestamp(),
         }
         .serialize();
         publisher
@@ -1929,27 +1967,31 @@ impl Daemon {
         node_id: NodeId,
         outputs: Vec<DataId>,
     ) -> eyre::Result<()> {
-        let dataflow = self
-            .running
-            .get_mut(&dataflow_id)
-            .wrap_err_with(|| format!("no running dataflow with ID `{dataflow_id}`"))?;
-        let local_node_inputs: BTreeSet<_> = dataflow
-            .mappings
-            .iter()
-            .filter(|(k, _)| k.0 == node_id && outputs.contains(&k.1))
-            .flat_map(|(_, v)| v)
-            .cloned()
-            .collect();
-        for (receiver_id, input_id) in &local_node_inputs {
-            close_input(dataflow, receiver_id, input_id, &self.clock);
-        }
-
-        let mut closed = Vec::new();
-        for output_id in &dataflow.open_external_mappings {
-            if output_id.0 == node_id && outputs.contains(&output_id.1) {
-                closed.push(output_id.clone());
+        let (local_node_inputs, closed) = {
+            let mut dataflow = self
+                .state
+                .running
+                .get_mut(&dataflow_id)
+                .wrap_err_with(|| format!("no running dataflow with ID `{dataflow_id}`"))?;
+            let local_node_inputs: BTreeSet<_> = dataflow
+                .mappings
+                .iter()
+                .filter(|(k, _)| k.0 == node_id && outputs.contains(&k.1))
+                .flat_map(|(_, v)| v)
+                .cloned()
+                .collect();
+            for (receiver_id, input_id) in &local_node_inputs {
+                close_input(&mut *dataflow, receiver_id, input_id, &self.state.clock);
             }
-        }
+
+            let mut closed = Vec::new();
+            for output_id in &dataflow.open_external_mappings {
+                if output_id.0 == node_id && outputs.contains(&output_id.1) {
+                    closed.push(output_id.clone());
+                }
+            }
+            (local_node_inputs, closed)
+        };
 
         for output_id in closed {
             let event = InterDaemonEvent::OutputClosed {
@@ -2025,18 +2067,20 @@ impl Daemon {
         node_id: &NodeId,
         might_restart: bool,
     ) -> eyre::Result<()> {
-        let dataflow = self
-            .running
-            .get_mut(&dataflow_id)
-            .ok_or_else(|| eyre!("no running dataflow with ID `{dataflow_id}`"))?;
-
-        let outputs = dataflow
-            .mappings
-            .keys()
-            .filter(|m| &m.0 == node_id)
-            .map(|m| &m.1)
-            .cloned()
-            .collect();
+        let outputs = {
+            let dataflow = self
+                .state
+                .running
+                .get(&dataflow_id)
+                .ok_or_else(|| eyre!("no running dataflow with ID `{dataflow_id}`"))?;
+            dataflow
+                .mappings
+                .keys()
+                .filter(|m| &m.0 == node_id)
+                .map(|m| &m.1)
+                .cloned()
+                .collect()
+        };
 
         if might_restart {
             self.logger
@@ -2053,11 +2097,9 @@ impl Daemon {
                 .await?;
         }
 
-        let dataflow = self
-            .running
-            .get_mut(&dataflow_id)
-            .ok_or_else(|| eyre!("no running dataflow with ID `{dataflow_id}`"))?;
-        dataflow.drop_channels.remove(node_id);
+        if let Some(mut dataflow) = self.state.running.get_mut(&dataflow_id) {
+            dataflow.drop_channels.remove(node_id);
+        }
         Ok(())
     }
 
@@ -2071,13 +2113,14 @@ impl Daemon {
             .handle_node_stop_inner(dataflow_id, node_id, dynamic_node)
             .await;
         let _ = self
+            .state
             .events_tx
             .send(Timestamped {
                 inner: Event::NodeStopped {
                     dataflow_id,
                     node_id: node_id.clone(),
                 },
-                timestamp: self.clock.new_timestamp(),
+                timestamp: self.state.clock.new_timestamp(),
             })
             .await;
         result
@@ -2090,31 +2133,33 @@ impl Daemon {
         dynamic_node: bool,
     ) -> eyre::Result<()> {
         let mut logger = self.logger.for_dataflow(dataflow_id);
-        let dataflow = match self.running.get_mut(&dataflow_id) {
-            Some(dataflow) => dataflow,
-            None if dynamic_node => {
-                // The dataflow might be done already as we don't wait for dynamic nodes. In this
-                // case, we don't need to do anything to handle the node stop.
-                tracing::debug!(
-                    "dynamic node {dataflow_id}/{node_id} stopped after dataflow was done"
-                );
-                return Ok(());
-            }
-            None => eyre::bail!(
-                "failed to get downstream nodes: no running dataflow with ID `{dataflow_id}`"
-            ),
-        };
+        {
+            let mut dataflow = match self.state.running.get_mut(&dataflow_id) {
+                Some(dataflow) => dataflow,
+                None if dynamic_node => {
+                    // The dataflow might be done already as we don't wait for dynamic nodes. In this
+                    // case, we don't need to do anything to handle the node stop.
+                    tracing::debug!(
+                        "dynamic node {dataflow_id}/{node_id} stopped after dataflow was done"
+                    );
+                    return Ok(());
+                }
+                None => eyre::bail!(
+                    "failed to get downstream nodes: no running dataflow with ID `{dataflow_id}`"
+                ),
+            };
 
-        dataflow
-            .pending_nodes
-            .handle_node_stop(
-                node_id,
-                &mut self.coordinator_connection,
-                &self.clock,
-                &mut dataflow.cascading_error_causes,
-                &mut logger,
-            )
-            .await?;
+            let df = &mut *dataflow;
+            df.pending_nodes
+                .handle_node_stop(
+                    node_id,
+                    &mut self.coordinator_connection,
+                    &self.state.clock,
+                    &mut df.cascading_error_causes,
+                    &mut logger,
+                )
+                .await?;
+        }
 
         // node only reaches here if it will not be restarted
         let might_restart = false;
@@ -2123,7 +2168,7 @@ impl Daemon {
             .await?;
 
         let should_finish = {
-            let dataflow = self.running.get_mut(&dataflow_id).wrap_err_with(|| {
+            let mut dataflow = self.state.running.get_mut(&dataflow_id).wrap_err_with(|| {
                 format!(
                     "failed to get downstream nodes: no running dataflow with ID `{dataflow_id}`"
                 )
@@ -2154,11 +2199,12 @@ impl Daemon {
         // Dynamic nodes don't send SpawnedNodeResult events, so there may be no entry
         // in dataflow_node_results. An empty map means all dynamic nodes handled stop successfully.
         let result = DataflowDaemonResult {
-            timestamp: self.clock.new_timestamp(),
+            timestamp: self.state.clock.new_timestamp(),
             node_results: self
+                .state
                 .dataflow_node_results
                 .get(&dataflow_id)
-                .cloned()
+                .map(|entry| entry.value().clone())
                 .unwrap_or_default(),
         };
 
@@ -2174,26 +2220,26 @@ impl Daemon {
                 LogLevel::Info,
                 None,
                 Some("daemon".into()),
-                format!("dataflow finished on machine `{}`", self.daemon_id),
+                format!("dataflow finished on machine `{}`", self.state.daemon_id),
             )
             .await;
 
         if let Some(connection) = &mut self.coordinator_connection {
             let msg = serde_json::to_vec(&Timestamped {
                 inner: CoordinatorRequest::Event {
-                    daemon_id: self.daemon_id.clone(),
+                    daemon_id: self.state.daemon_id.clone(),
                     event: DaemonEvent::AllNodesFinished {
                         dataflow_id,
                         result,
                     },
                 },
-                timestamp: self.clock.new_timestamp(),
+                timestamp: self.state.clock.new_timestamp(),
             })?;
             socket_stream_send(connection, &msg)
                 .await
                 .wrap_err("failed to report dataflow finish to dora-coordinator")?;
         }
-        self.running.remove(&dataflow_id);
+        self.state.running.remove(&dataflow_id);
 
         Ok(())
     }
@@ -2205,17 +2251,17 @@ impl Daemon {
                 interval,
                 metadata,
             } => {
-                let Some(dataflow) = self.running.get_mut(&dataflow_id) else {
+                let Some(mut dataflow) = self.state.running.get_mut(&dataflow_id) else {
                     tracing::warn!("Timer event for unknown dataflow `{dataflow_id}`");
                     return Ok(());
                 };
 
-                let Some(subscribers) = dataflow.timers.get(&interval) else {
+                let Some(subscribers) = dataflow.timers.get(&interval).cloned() else {
                     return Ok(());
                 };
 
                 let mut closed = Vec::new();
-                for (receiver_id, input_id) in subscribers {
+                for (receiver_id, input_id) in &subscribers {
                     let Some(channel) = dataflow.subscribe_channels.get(receiver_id) else {
                         continue;
                     };
@@ -2227,16 +2273,16 @@ impl Daemon {
                             metadata: metadata.clone(),
                             data: None,
                         },
-                        &self.clock,
+                        &self.state.clock,
                     );
                     match send_result {
                         Ok(()) => {}
                         Err(_) => {
-                            closed.push(receiver_id);
+                            closed.push(receiver_id.clone());
                         }
                     }
                 }
-                for id in closed {
+                for id in &closed {
                     dataflow.subscribe_channels.remove(id);
                 }
             }
@@ -2246,12 +2292,12 @@ impl Daemon {
                 message,
                 metadata,
             } => {
-                let Some(dataflow) = self.running.get_mut(&dataflow_id) else {
+                let Some(mut dataflow) = self.state.running.get_mut(&dataflow_id) else {
                     tracing::warn!("Logs event for unknown dataflow `{dataflow_id}`");
                     return Ok(());
                 };
 
-                let Some(subscribers) = dataflow.mappings.get(&output_id) else {
+                let Some(subscribers) = dataflow.mappings.get(&output_id).cloned() else {
                     tracing::warn!(
                         "No subscribers found for {:?} in {:?}",
                         output_id,
@@ -2261,7 +2307,7 @@ impl Daemon {
                 };
 
                 let mut closed = Vec::new();
-                for (receiver_id, input_id) in subscribers {
+                for (receiver_id, input_id) in &subscribers {
                     let Some(channel) = dataflow.subscribe_channels.get(receiver_id) else {
                         tracing::warn!("No subscriber channel found for {:?}", output_id);
                         continue;
@@ -2274,16 +2320,16 @@ impl Daemon {
                             metadata: metadata.clone(),
                             data: Some(message.clone()),
                         },
-                        &self.clock,
+                        &self.state.clock,
                     );
                     match send_result {
                         Ok(()) => {}
                         Err(_) => {
-                            closed.push(receiver_id);
+                            closed.push(receiver_id.clone());
                         }
                     }
                 }
-                for id in closed {
+                for id in &closed {
                     dataflow.subscribe_channels.remove(id);
                 }
             }
@@ -2309,15 +2355,29 @@ impl Daemon {
                 let node_result = match exit_status {
                     NodeExitStatus::Success => Ok(()),
                     exit_status => {
-                        let dataflow = self.running.get(&dataflow_id);
-                        let caused_by_node = dataflow
-                            .and_then(|dataflow| {
-                                dataflow.cascading_error_causes.error_caused_by(&node_id)
-                            })
-                            .cloned();
-                        let grace_duration_kill = dataflow
-                            .map(|d| d.grace_duration_kills.contains(&node_id))
-                            .unwrap_or_default();
+                        // Extract all needed info from the dataflow Ref in one shot
+                        let (caused_by_node, grace_duration_kill, stderr_lines) =
+                            if let Some(dataflow) = self.state.running.get(&dataflow_id) {
+                                let caused_by = dataflow
+                                    .cascading_error_causes
+                                    .error_caused_by(&node_id)
+                                    .cloned();
+                                let grace_kill = dataflow.grace_duration_kills.contains(&node_id);
+                                let stderr =
+                                    dataflow.node_stderr_most_recent.get(&node_id).map(|queue| {
+                                        let mut lines = Vec::new();
+                                        if queue.is_full() {
+                                            lines.push("[...]".into());
+                                        }
+                                        while let Some(line) = queue.pop() {
+                                            lines.push(line);
+                                        }
+                                        lines
+                                    });
+                                (caused_by, grace_kill, stderr)
+                            } else {
+                                (None, false, None)
+                            };
 
                         let cause = match caused_by_node {
                             Some(caused_by_node) => {
@@ -2333,18 +2393,7 @@ impl Daemon {
                             }
                             None if grace_duration_kill => NodeErrorCause::GraceDuration,
                             None => {
-                                let cause = dataflow
-                                    .and_then(|d| d.node_stderr_most_recent.get(&node_id))
-                                    .map(|queue| {
-                                        let mut lines = Vec::new();
-                                        if queue.is_full() {
-                                            lines.push("[...]".into());
-                                        }
-                                        while let Some(line) = queue.pop() {
-                                            lines.push(line);
-                                        }
-                                        lines
-                                    })
+                                let cause = stderr_lines
                                     .map(extract_err_from_stderr)
                                     .unwrap_or_default();
 
@@ -2352,7 +2401,7 @@ impl Daemon {
                             }
                         };
                         Err(NodeError {
-                            timestamp: self.clock.new_timestamp(),
+                            timestamp: self.state.clock.new_timestamp(),
                             cause,
                             exit_status,
                         })
@@ -2383,7 +2432,8 @@ impl Daemon {
                         )
                         .await;
                 } else {
-                    self.dataflow_node_results
+                    self.state
+                        .dataflow_node_results
                         .entry(dataflow_id)
                         .or_default()
                         .insert(node_id.clone(), node_result);
