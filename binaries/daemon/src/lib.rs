@@ -941,18 +941,10 @@ impl Daemon {
             }
             DaemonCoordinatorEvent::Destroy => {
                 tracing::info!("received destroy command -> exiting");
-                let (notify_tx, notify_rx) = oneshot::channel();
-                let reply = DaemonCoordinatorReply::DestroyResult {
-                    result: Ok(()),
-                    notify: Some(notify_tx),
-                };
+                let reply = DaemonCoordinatorReply::DestroyResult { result: Ok(()) };
                 let _ = reply_tx
                     .send(Some(reply))
                     .map_err(|_| error!("could not send destroy reply from daemon to coordinator"));
-                // wait until the reply is sent out
-                if notify_rx.await.is_err() {
-                    tracing::warn!("no confirmation received for DestroyReply");
-                }
                 RunStatus::Exit
             }
             DaemonCoordinatorEvent::Heartbeat => {
@@ -2503,11 +2495,14 @@ async fn set_up_event_stream(
             timestamp: clock_cloned.new_timestamp(),
         },
     });
-    let (daemon_id, coordinator_events) =
-        coordinator::register(coordinator_addr, machine_id.clone(), clock)
+
+    // Create mpsc channel for coordinator RPC requests (bridged from tarpc server)
+    let (coordinator_tx, coordinator_rx) = mpsc::channel(10);
+    let (daemon_id, _rpc_server_handle) =
+        coordinator::register(coordinator_addr, machine_id.clone(), clock, coordinator_tx)
             .await
             .wrap_err("failed to connect to dora-coordinator")?;
-    let coordinator_events = coordinator_events.map(
+    let coordinator_events = ReceiverStream::new(coordinator_rx).map(
         |Timestamped {
              inner: event,
              timestamp,
@@ -2516,6 +2511,7 @@ async fn set_up_event_stream(
             timestamp,
         },
     );
+
     let (events_tx, events_rx) = flume::bounded(10);
     let _listen_port =
         local_listener::spawn_listener_loop((LOCALHOST, local_listen_port).into(), events_tx)
