@@ -8,7 +8,7 @@ use std::{
 
 use dora_message::{
     DataflowId,
-    daemon_to_node::{DaemonCommunication, DaemonReply, DataMessage, NodeEvent, StopCause},
+    daemon_to_node::{DaemonCommunication, DaemonReply, DataMessage, NodeEvent},
     id::DataId,
     node_to_daemon::{DaemonRequest, Timestamped},
 };
