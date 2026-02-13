@@ -8,11 +8,11 @@ use std::{
 
 use dora_message::{
     DataflowId,
-    daemon_to_node::{DaemonCommunication, DaemonReply, DataMessage, NodeEvent},
+    daemon_to_node::{DaemonCommunication, DaemonReply, DataMessage, NodeEvent, StopCause},
     id::DataId,
     node_to_daemon::{DaemonRequest, Timestamped},
 };
-pub use event::{Event, StopReason};
+pub use event::{Event, StopCause};
 use futures::{
     FutureExt, Stream, StreamExt,
     future::{Either, select},
@@ -348,13 +348,14 @@ impl EventStream {
         if let Some(write_events_to) = &mut self.write_events_to {
             let event_json = match event {
                 EventItem::NodeEvent { event, .. } => match event {
-                    NodeEvent::Stop { .. } => {
+                    NodeEvent::Stop { reason } => {
                         let time_offset = self
                             .clock
                             .new_timestamp()
                             .get_diff_duration(&self.start_timestamp);
                         let event_json = serde_json::json!({
                             "type": "Stop",
+                            "reason": format!("{:?}", reason.as_ref().unwrap_or(&StopCause::Manual)),
                             "time_offset_secs": time_offset.as_secs_f64(),
                         });
                         Some(event_json)
@@ -483,7 +484,7 @@ impl EventStream {
     fn convert_event_item(item: EventItem) -> Event {
         match item {
             EventItem::NodeEvent { event, ack_channel } => match event {
-                NodeEvent::Stop { reason } => Event::Stop(reason.unwrap_or(StopReason::Manual)),
+                NodeEvent::Stop { reason } => Event::Stop(reason.unwrap_or(StopCause::Manual)),
                 NodeEvent::Reload { operator_id } => Event::Reload { operator_id },
                 NodeEvent::InputClosed { id } => Event::InputClosed { id },
                 NodeEvent::Input { id, metadata, data } => {
@@ -497,7 +498,7 @@ impl EventStream {
                         Err(err) => Event::Error(format!("{err:?}")),
                     }
                 }
-                NodeEvent::AllInputsClosed => Event::Stop(StopReason::AllInputsClosed),
+                NodeEvent::AllInputsClosed => Event::Stop(StopCause::AllInputsClosed),
             },
 
             EventItem::FatalError(err) => {

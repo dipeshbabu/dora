@@ -26,7 +26,7 @@ use dora_message::{
         CoordinatorRequest, DaemonCoordinatorReply, DaemonEvent, DataflowDaemonResult,
     },
     daemon_to_daemon::InterDaemonEvent,
-    daemon_to_node::{DaemonReply, NodeConfig, NodeDropEvent, NodeEvent, StopReason},
+    daemon_to_node::{DaemonReply, NodeConfig, NodeDropEvent, NodeEvent, StopCause},
     descriptor::{NodeSource, RestartPolicy},
     metadata::{self, ArrowTypeInfo},
     node_to_daemon::{DynamicNodeEvent, Timestamped},
@@ -2014,22 +2014,22 @@ impl Daemon {
                     node_id
                 );
 
+                // Set pending_hot_reload flag before sending the stop event to avoid races
+                let running_node = dataflow.running_nodes.get(&node_id).unwrap();
+                running_node
+                    .pending_hot_reload
+                    .store(true, std::sync::atomic::Ordering::Release);
+
                 // Send Stop event with HotReload reason
                 if let Some(channel) = dataflow.subscribe_channels.get(&node_id) {
                     let _ = send_with_timestamp(
                         channel,
                         NodeEvent::Stop {
-                            reason: Some(StopReason::HotReload),
+                            reason: Some(StopCause::HotReload),
                         },
                         &self.clock,
                     );
                 }
-
-                // Set pending_hot_reload flag so the restart loop will restart the node
-                let running_node = dataflow.running_nodes.get(&node_id).unwrap();
-                running_node
-                    .pending_hot_reload
-                    .store(true, std::sync::atomic::Ordering::Release);
 
                 // Spawn a fallback task: if the node doesn't exit within 2 seconds, send SIGTERM
                 if let Some(process) = &running_node.process {
@@ -2099,9 +2099,9 @@ impl Daemon {
         );
 
         let stop_reason = if preserve_output_mappings {
-            StopReason::HotReload
+            StopCause::HotReload
         } else {
-            StopReason::Manual
+            StopCause::Manual
         };
         if let Some(channel) = dataflow.subscribe_channels.get(&node_id) {
             let _ = send_with_timestamp(
@@ -2484,7 +2484,7 @@ impl Daemon {
             let _ = send_with_timestamp(
                 &event_sender,
                 NodeEvent::Stop {
-                    reason: Some(StopReason::Manual),
+                    reason: Some(StopCause::Manual),
                 },
                 clock,
             );
@@ -3420,7 +3420,7 @@ impl RunningDataflow {
             let _ = send_with_timestamp(
                 &channel,
                 NodeEvent::Stop {
-                    reason: Some(StopReason::Manual),
+                    reason: Some(StopCause::Manual),
                 },
                 clock,
             );

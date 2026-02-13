@@ -1,6 +1,6 @@
 use dora_arrow_convert::ArrowData;
 use dora_core::config::{DataId, OperatorId};
-pub use dora_message::daemon_to_node::StopReason;
+pub use dora_message::daemon_to_node::StopCause;
 use dora_message::metadata::Metadata;
 
 /// Represents an incoming Dora event.
@@ -44,10 +44,10 @@ pub enum Event {
     },
     /// Notification that the event stream is about to close.
     ///
-    /// The [`StopReason`] field contains the reason for the event stream closure.
+    /// The [`StopCause`] field contains the reason for the event stream closure.
     ///
     /// Nodes should exit once the event stream closes.
-    Stop(StopReason),
+    Stop(StopCause),
     /// Instructs the node to reload itself or one of its operators.
     ///
     /// This event is currently only used for reloading Python operators that are
